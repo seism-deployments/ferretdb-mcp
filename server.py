@@ -1,214 +1,277 @@
 from fastmcp import FastMCP
-import subprocess
+import asyncio
 import os
+import subprocess
 import shutil
-from typing import Optional, List
+from typing import Optional
 
-mcp = FastMCP("FerretDB")
+mcp = FastMCP("ferretdb")
 
 
-def _run_command(cmd: List[str], capture_output: bool = True) -> dict:
-    """Helper to run a subprocess command and return result."""
+def _run_subprocess(args: list[str], timeout: int = 60) -> dict:
+    """Run a subprocess and return structured output."""
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=capture_output,
+            args,
+            capture_output=True,
             text=True,
-            timeout=300
+            timeout=timeout
         )
         return {
             "success": result.returncode == 0,
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "command": " ".join(cmd)
+            "command": " ".join(args)
         }
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         return {
             "success": False,
             "returncode": -1,
             "stdout": "",
-            "stderr": f"Command timed out: {str(e)}",
-            "command": " ".join(cmd)
+            "stderr": f"Command timed out after {timeout} seconds",
+            "command": " ".join(args)
         }
     except FileNotFoundError as e:
         return {
             "success": False,
             "returncode": -1,
             "stdout": "",
-            "stderr": f"Executable not found: {str(e)}",
-            "command": " ".join(cmd)
+            "stderr": f"Binary not found: {e}",
+            "command": " ".join(args)
         }
     except Exception as e:
         return {
             "success": False,
             "returncode": -1,
             "stdout": "",
-            "stderr": f"Unexpected error: {str(e)}",
-            "command": " ".join(cmd)
+            "stderr": str(e),
+            "command": " ".join(args)
         }
 
 
 @mcp.tool()
-async def run_ferretdb(
-    listen_addr: Optional[str] = "127.0.0.1:27017",
+async def run_ferretdb_server(
+    listen_addr: str = "127.0.0.1:27017",
     postgresql_url: Optional[str] = None,
-    log_level: Optional[str] = "info",
-    log_format: Optional[str] = "console",
-    tls: Optional[bool] = False,
-    tls_cert_file: Optional[str] = None,
-    tls_key_file: Optional[str] = None
+    log_level: str = "info",
+    tls: bool = False,
+    extra_flags: Optional[list] = None
 ) -> dict:
     """
-    Start the FerretDB server with specified configuration.
-    Use this when you need to launch the FerretDB proxy that converts MongoDB wire protocol
-    to SQL for PostgreSQL with DocumentDB extension.
-    Supports configuring listen address, backend, logging, and TLS options.
+    Start the FerretDB server process with specified configuration.
+    Use this when you need to launch FerretDB as a MongoDB-compatible proxy
+    connected to a PostgreSQL/DocumentDB backend. Supports configuring listen
+    addresses, backend connection strings, TLS, logging, and other server options.
     """
-    cmd = ["ferretdb"]
+    args = ["ferretdb"]
 
     if listen_addr:
-        cmd.extend(["--listen-addr", listen_addr])
+        args.extend([f"--listen-addr={listen_addr}"])
 
     if postgresql_url:
-        cmd.extend(["--postgresql-url", postgresql_url])
+        args.extend([f"--postgresql-url={postgresql_url}"])
 
     if log_level:
-        cmd.extend(["--log-level", log_level])
-
-    if log_format:
-        cmd.extend(["--log-format", log_format])
+        args.extend([f"--log-level={log_level}"])
 
     if tls:
-        cmd.append("--tls")
+        args.append("--tls")
 
-    if tls_cert_file:
-        cmd.extend(["--tls-cert-file", tls_cert_file])
-
-    if tls_key_file:
-        cmd.extend(["--tls-key-file", tls_key_file])
+    if extra_flags:
+        args.extend(extra_flags)
 
     # Check if ferretdb binary exists
-    if not shutil.which("ferretdb"):
+    ferretdb_bin = shutil.which("ferretdb")
+    if not ferretdb_bin:
+        # Try common build output paths
+        for candidate in ["./ferretdb", "./bin/ferretdb", "./build/ferretdb"]:
+            if os.path.isfile(candidate):
+                args[0] = candidate
+                ferretdb_bin = candidate
+                break
+
+    if not ferretdb_bin and args[0] == "ferretdb":
         return {
             "success": False,
-            "error": "ferretdb binary not found in PATH",
-            "command": " ".join(cmd),
-            "suggestion": "Please ensure FerretDB is installed and available in your PATH"
+            "error": "ferretdb binary not found in PATH or common build directories",
+            "attempted_command": " ".join(args),
+            "suggestion": "Build FerretDB first with 'go build ./cmd/ferretdb/...' or ensure the binary is in PATH"
         }
 
-    result = _run_command(cmd)
-    result["config"] = {
-        "listen_addr": listen_addr,
-        "postgresql_url": postgresql_url,
-        "log_level": log_level,
-        "log_format": log_format,
-        "tls": tls,
-        "tls_cert_file": tls_cert_file,
-        "tls_key_file": tls_key_file
-    }
-    return result
+    # Start the process in background (non-blocking)
+    try:
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        # Give it a moment to start or fail immediately
+        await asyncio.sleep(1)
+        poll_result = process.poll()
+        if poll_result is not None:
+            stdout, stderr = process.communicate(timeout=5)
+            return {
+                "success": False,
+                "pid": None,
+                "returncode": poll_result,
+                "stdout": stdout,
+                "stderr": stderr,
+                "command": " ".join(args),
+                "message": "FerretDB process exited immediately"
+            }
+        return {
+            "success": True,
+            "pid": process.pid,
+            "command": " ".join(args),
+            "listen_addr": listen_addr,
+            "postgresql_url": postgresql_url,
+            "log_level": log_level,
+            "tls_enabled": tls,
+            "message": f"FerretDB server started with PID {process.pid}. Use kill {process.pid} to stop it."
+        }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": f"Binary not found: {args[0]}",
+            "command": " ".join(args)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "command": " ".join(args)
+        }
 
 
 @mcp.tool()
 async def setup_environment(
     compose_file: Optional[str] = None,
-    log_level: Optional[str] = "info",
-    services: Optional[List[str]] = None
+    verbose: bool = False,
+    skip_pull: bool = False
 ) -> dict:
     """
-    Set up the development or test environment for FerretDB using envtool.
-    Use this to initialize required services, create directories, pull Docker images,
-    and prepare the environment before running tests or development work.
-    This runs the envtool setup subcommand.
+    Run the envtool setup subcommand to initialize and configure the development
+    or test environment. Use this to prepare Docker services, check dependencies,
+    and ensure all required infrastructure (PostgreSQL, DocumentDB extension, etc.)
+    is ready before running tests or the server.
     """
-    # Check if envtool binary exists
+    # Find envtool binary
     envtool_bin = shutil.which("envtool")
     if not envtool_bin:
-        # Try go run as fallback
+        for candidate in ["./envtool", "./bin/envtool", "./cmd/envtool/envtool"]:
+            if os.path.isfile(candidate):
+                envtool_bin = candidate
+                break
+
+    if not envtool_bin:
+        # Fall back to go run
         envtool_bin = None
 
-    cmd = []
     if envtool_bin:
-        cmd = ["envtool", "setup"]
+        args = [envtool_bin, "setup"]
     else:
-        cmd = ["go", "run", "./cmd/envtool", "setup"]
+        args = ["go", "run", "./cmd/envtool", "setup"]
+
+    if verbose:
+        args.append("--verbose")
+
+    if skip_pull:
+        args.append("--skip-pull")
 
     if compose_file:
-        cmd.extend(["--compose-file", compose_file])
+        args.extend(["--compose-file", compose_file])
 
-    if log_level:
-        cmd.extend(["--log-level", log_level])
-
-    if services:
-        for service in services:
-            cmd.append(service)
-
-    result = _run_command(cmd)
-    result["setup_config"] = {
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=300))
+    result["tool"] = "setup_environment"
+    result["config"] = {
         "compose_file": compose_file,
-        "log_level": log_level,
-        "services": services
+        "verbose": verbose,
+        "skip_pull": skip_pull
     }
     return result
 
 
 @mcp.tool()
 async def run_tests(
-    packages: Optional[List[str]] = None,
+    packages: Optional[list] = None,
     run_filter: Optional[str] = None,
-    timeout: Optional[str] = "10m",
-    count: Optional[int] = 1,
-    short: Optional[bool] = False,
-    verbose: Optional[bool] = False,
-    tags: Optional[List[str]] = None
+    timeout: str = "10m",
+    tags: Optional[list] = None,
+    short: bool = False,
+    count: int = 1,
+    verbose: bool = False
 ) -> dict:
     """
-    Run FerretDB Go tests using envtool's test runner, which provides enhanced output formatting,
-    test filtering, and result reporting. Use this to execute unit tests, integration tests,
-    or specific test packages with detailed pass/fail/skip reporting.
+    Execute Go tests using the envtool test runner, which provides enhanced output
+    formatting, panic recovery, and structured logging. Use this to run unit tests,
+    integration tests, or specific test packages with proper test filtering and
+    output handling.
     """
     if packages is None:
         packages = ["./..."]
 
-    # Check if envtool binary exists
+    # Find envtool binary
     envtool_bin = shutil.which("envtool")
+    if not envtool_bin:
+        for candidate in ["./envtool", "./bin/envtool"]:
+            if os.path.isfile(candidate):
+                envtool_bin = candidate
+                break
 
-    cmd = []
     if envtool_bin:
-        cmd = ["envtool", "test"]
+        args = [envtool_bin, "test"]
     else:
-        cmd = ["go", "run", "./cmd/envtool", "test"]
-
-    if timeout:
-        cmd.extend(["--timeout", timeout])
-
-    if count is not None and count != 1:
-        cmd.extend(["--count", str(count)])
-
-    if short:
-        cmd.append("--short")
-
-    if verbose:
-        cmd.append("--verbose")
-
-    if tags:
-        cmd.extend(["--tags", ",".join(tags)])
+        args = ["go", "run", "./cmd/envtool", "test"]
 
     if run_filter:
-        cmd.extend(["--run", run_filter])
+        args.extend(["--run", run_filter])
 
-    cmd.extend(packages)
+    if timeout:
+        args.extend(["--timeout", timeout])
 
-    result = _run_command(cmd)
-    result["test_config"] = {
+    if tags:
+        args.extend(["--tags", ",".join(tags)])
+
+    if short:
+        args.append("--short")
+
+    if count and count != 1:
+        args.extend(["--count", str(count)])
+
+    if verbose:
+        args.append("-v")
+
+    args.extend(packages)
+
+    # Parse timeout string to seconds for subprocess timeout
+    timeout_seconds = 600
+    try:
+        if timeout.endswith("h"):
+            timeout_seconds = int(timeout[:-1]) * 3600
+        elif timeout.endswith("m"):
+            timeout_seconds = int(timeout[:-1]) * 60
+        elif timeout.endswith("s"):
+            timeout_seconds = int(timeout[:-1])
+    except (ValueError, IndexError):
+        timeout_seconds = 600
+
+    # Add buffer for process overhead
+    subprocess_timeout = timeout_seconds + 60
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=subprocess_timeout))
+    result["tool"] = "run_tests"
+    result["config"] = {
         "packages": packages,
         "run_filter": run_filter,
         "timeout": timeout,
-        "count": count,
+        "tags": tags,
         "short": short,
-        "verbose": verbose,
-        "tags": tags
+        "count": count,
+        "verbose": verbose
     }
     return result
 
@@ -217,277 +280,306 @@ async def run_tests(
 async def run_fuzz(
     fuzz_target: str,
     package: str,
-    fuzz_time: Optional[str] = "30s",
-    corpus_dir: Optional[str] = None,
-    parallel: Optional[int] = None
+    fuzz_time: str = "30s",
+    corpus_dir: Optional[str] = None
 ) -> dict:
     """
-    Run fuzz tests for FerretDB using envtool's fuzz subcommand.
-    Use this to execute Go fuzz testing against specific fuzz targets to discover
-    edge cases and potential bugs in FerretDB's protocol handling or data processing.
+    Execute Go fuzz tests using the envtool fuzz subcommand. Use this to run
+    fuzzing campaigns against FerretDB to discover edge cases and bugs in protocol
+    handling or BSON parsing. Supports selecting specific fuzz targets and
+    controlling duration.
     """
-    # Check if envtool binary exists
+    # Find envtool binary
     envtool_bin = shutil.which("envtool")
+    if not envtool_bin:
+        for candidate in ["./envtool", "./bin/envtool"]:
+            if os.path.isfile(candidate):
+                envtool_bin = candidate
+                break
 
-    cmd = []
     if envtool_bin:
-        cmd = ["envtool", "fuzz"]
+        args = [envtool_bin, "fuzz"]
     else:
-        cmd = ["go", "run", "./cmd/envtool", "fuzz"]
+        args = ["go", "run", "./cmd/envtool", "fuzz"]
 
-    if fuzz_time:
-        cmd.extend(["--fuzz-time", fuzz_time])
+    args.extend(["--fuzz", fuzz_target])
+    args.extend(["--fuzz-time", fuzz_time])
 
     if corpus_dir:
-        cmd.extend(["--corpus-dir", corpus_dir])
+        args.extend(["--corpus-dir", corpus_dir])
 
-    if parallel is not None:
-        cmd.extend(["--parallel", str(parallel)])
+    args.append(package)
 
-    cmd.extend(["--fuzz", fuzz_target, package])
+    # Parse fuzz_time to determine subprocess timeout
+    fuzz_seconds = 30
+    try:
+        if fuzz_time.endswith("h"):
+            fuzz_seconds = int(fuzz_time[:-1]) * 3600
+        elif fuzz_time.endswith("m"):
+            fuzz_seconds = int(fuzz_time[:-1]) * 60
+        elif fuzz_time.endswith("s"):
+            fuzz_seconds = int(fuzz_time[:-1])
+    except (ValueError, IndexError):
+        fuzz_seconds = 30
 
-    result = _run_command(cmd)
-    result["fuzz_config"] = {
+    subprocess_timeout = fuzz_seconds + 60
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: _run_subprocess(args, timeout=subprocess_timeout))
+    result["tool"] = "run_fuzz"
+    result["config"] = {
         "fuzz_target": fuzz_target,
         "package": package,
         "fuzz_time": fuzz_time,
-        "corpus_dir": corpus_dir,
-        "parallel": parallel
+        "corpus_dir": corpus_dir
     }
     return result
 
 
 @mcp.tool()
-async def print_version(
-    format: Optional[str] = "text"
+async def get_version_info(
+    format: str = "text",
+    version_file: str = "build/version/version.txt"
 ) -> dict:
     """
-    Print FerretDB version information including build metadata, Git commit hash, and Go runtime version.
-    Use this to check the current version of FerretDB being used or to retrieve version info
-    for debugging and reporting purposes.
+    Retrieve version information for the FerretDB build, including the version
+    string, git commit hash, build date, and Go runtime version. Use this to
+    verify which version is installed, inspect build metadata, or confirm a
+    build was successful.
     """
-    results = {}
+    result = {
+        "tool": "get_version_info",
+        "format": format,
+        "version_file": version_file
+    }
 
-    # Try ferretdb binary first
+    # Try reading the version file
+    version_content = None
+    if os.path.isfile(version_file):
+        try:
+            with open(version_file, "r") as f:
+                version_content = f.read().strip()
+            result["version_file_content"] = version_content
+        except Exception as e:
+            result["version_file_error"] = str(e)
+    else:
+        result["version_file_error"] = f"Version file not found: {version_file}"
+
+    # Try running ferretdb --version
     ferretdb_bin = shutil.which("ferretdb")
+    if not ferretdb_bin:
+        for candidate in ["./ferretdb", "./bin/ferretdb", "./build/ferretdb"]:
+            if os.path.isfile(candidate):
+                ferretdb_bin = candidate
+                break
+
     if ferretdb_bin:
+        version_args = [ferretdb_bin, "--version"]
         if format == "json":
-            cmd = ["ferretdb", "--version", "--log-format", "json"]
-        else:
-            cmd = ["ferretdb", "--version"]
-        ferretdb_result = _run_command(cmd)
-        results["ferretdb"] = ferretdb_result
+            version_args.append("--json")
+        loop = asyncio.get_event_loop()
+        version_result = await loop.run_in_executor(
+            None, lambda: _run_subprocess(version_args, timeout=10)
+        )
+        result["ferretdb_version_output"] = version_result
     else:
-        results["ferretdb"] = {
-            "success": False,
-            "error": "ferretdb binary not found in PATH"
-        }
+        result["ferretdb_binary"] = "not found"
 
-    # Try envtool version as well
+    # Try running envtool version
     envtool_bin = shutil.which("envtool")
-    if envtool_bin:
-        if format == "json":
-            envtool_cmd = ["envtool", "version", "--json"]
-        else:
-            envtool_cmd = ["envtool", "version"]
-        envtool_result = _run_command(envtool_cmd)
-        results["envtool"] = envtool_result
-    else:
-        # Try via go run
-        go_bin = shutil.which("go")
-        if go_bin:
-            go_cmd = ["go", "run", "./cmd/envtool", "version"]
-            go_result = _run_command(go_cmd)
-            results["envtool_via_go"] = go_result
-        else:
-            results["envtool"] = {
-                "success": False,
-                "error": "envtool binary and go not found in PATH"
-            }
+    if not envtool_bin:
+        for candidate in ["./envtool", "./bin/envtool"]:
+            if os.path.isfile(candidate):
+                envtool_bin = candidate
+                break
 
-    results["format"] = format
-    return results
+    if envtool_bin:
+        envtool_args = [envtool_bin, "version"]
+        if format == "json":
+            envtool_args.append("--json")
+        loop = asyncio.get_event_loop()
+        envtool_result = await loop.run_in_executor(
+            None, lambda: _run_subprocess(envtool_args, timeout=10)
+        )
+        result["envtool_version_output"] = envtool_result
+    else:
+        result["envtool_binary"] = "not found"
+
+    # Get Go version
+    loop = asyncio.get_event_loop()
+    go_result = await loop.run_in_executor(
+        None, lambda: _run_subprocess(["go", "version"], timeout=10)
+    )
+    result["go_version"] = go_result
+
+    return result
 
 
 @mcp.tool()
-async def shell_run(
-    operation: str,
-    paths: Optional[List[str]] = None,
-    command: Optional[str] = None,
-    args: Optional[List[str]] = None
+async def print_diagnostic_data(
+    include_compose_logs: bool = True,
+    setup_error_message: Optional[str] = None,
+    output_file: Optional[str] = None
 ) -> dict:
     """
-    Execute shell utility operations via envtool's shell subcommand, including creating directories,
-    removing directories, reading files, or running arbitrary shell commands needed for build
-    and development workflows. Use this for file system operations during CI/CD or development setup.
+    Collect and display diagnostic information about the FerretDB environment,
+    including Docker Compose service logs and system state. Use this when debugging
+    test failures, setup issues, or unexpected server behavior to gather context
+    about what went wrong.
     """
-    valid_operations = ["mkdir", "rmdir", "read", "exec"]
-    if operation not in valid_operations:
+    diagnostics = {
+        "tool": "print_diagnostic_data",
+        "setup_error_message": setup_error_message,
+        "output": {}
+    }
+
+    loop = asyncio.get_event_loop()
+
+    if include_compose_logs:
+        compose_logs = await loop.run_in_executor(
+            None, lambda: _run_subprocess(["docker", "compose", "logs"], timeout=30)
+        )
+        diagnostics["output"]["compose_logs"] = compose_logs
+
+        compose_ps = await loop.run_in_executor(
+            None, lambda: _run_subprocess(["docker", "compose", "ps", "--all"], timeout=30)
+        )
+        diagnostics["output"]["compose_ps"] = compose_ps
+
+        docker_stats = await loop.run_in_executor(
+            None, lambda: _run_subprocess(["docker", "stats", "--all", "--no-stream"], timeout=30)
+        )
+        diagnostics["output"]["docker_stats"] = docker_stats
+
+    # Git version
+    git_version = await loop.run_in_executor(
+        None, lambda: _run_subprocess(["git", "version"], timeout=10)
+    )
+    diagnostics["output"]["git_version"] = git_version
+
+    # Docker version
+    docker_version = await loop.run_in_executor(
+        None, lambda: _run_subprocess(["docker", "version"], timeout=10)
+    )
+    diagnostics["output"]["docker_version"] = docker_version
+
+    # Docker compose version
+    compose_version = await loop.run_in_executor(
+        None, lambda: _run_subprocess(["docker", "compose", "version"], timeout=10)
+    )
+    diagnostics["output"]["compose_version"] = compose_version
+
+    # Go version
+    go_version = await loop.run_in_executor(
+        None, lambda: _run_subprocess(["go", "version"], timeout=10)
+    )
+    diagnostics["output"]["go_version"] = go_version
+
+    # Read version file if it exists
+    version_file = "build/version/version.txt"
+    if os.path.isfile(version_file):
+        try:
+            with open(version_file, "r") as f:
+                diagnostics["output"]["ferretdb_version_file"] = f.read().strip()
+        except Exception as e:
+            diagnostics["output"]["ferretdb_version_file_error"] = str(e)
+
+    # Build summary output string
+    summary_lines = []
+    if setup_error_message:
+        summary_lines.append(f"Setup Error: {setup_error_message}")
+    for key, val in diagnostics["output"].items():
+        summary_lines.append(f"\n=== {key} ===")
+        if isinstance(val, dict):
+            if val.get("stdout"):
+                summary_lines.append(val["stdout"])
+            if val.get("stderr"):
+                summary_lines.append(f"STDERR: {val['stderr']}")
+        else:
+            summary_lines.append(str(val))
+
+    summary = "\n".join(summary_lines)
+    diagnostics["summary"] = summary
+
+    if output_file:
+        try:
+            os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
+            with open(output_file, "w") as f:
+                f.write(summary)
+            diagnostics["written_to_file"] = output_file
+        except Exception as e:
+            diagnostics["file_write_error"] = str(e)
+
+    return diagnostics
+
+
+@mcp.tool()
+async def shell_operations(
+    operation: str,
+    paths: list
+) -> dict:
+    """
+    Perform shell utility operations used during environment management: create
+    directories, remove directories, or read file contents. Use this to manage
+    the FerretDB build/test environment file system, such as creating test output
+    directories or reading configuration files.
+    """
+    if not paths:
         return {
             "success": False,
-            "error": f"Invalid operation '{operation}'. Must be one of: {', '.join(valid_operations)}"
+            "error": "No paths provided",
+            "operation": operation
         }
 
-    envtool_bin = shutil.which("envtool")
+    results = []
+    overall_success = True
 
     if operation == "mkdir":
-        if not paths:
-            return {"success": False, "error": "paths is required for mkdir operation"}
-        results = []
         for path in paths:
             try:
                 os.makedirs(path, exist_ok=True)
-                results.append({"path": path, "success": True})
+                results.append({"path": path, "success": True, "message": f"Directory created: {path}"})
             except Exception as e:
                 results.append({"path": path, "success": False, "error": str(e)})
-        return {
-            "success": all(r["success"] for r in results),
-            "operation": "mkdir",
-            "results": results
-        }
+                overall_success = False
 
     elif operation == "rmdir":
-        if not paths:
-            return {"success": False, "error": "paths is required for rmdir operation"}
-        results = []
         for path in paths:
             try:
                 if os.path.exists(path):
                     shutil.rmtree(path)
-                    results.append({"path": path, "success": True, "removed": True})
+                    results.append({"path": path, "success": True, "message": f"Directory removed: {path}"})
                 else:
-                    results.append({"path": path, "success": True, "removed": False, "note": "path did not exist"})
+                    results.append({"path": path, "success": True, "message": f"Directory did not exist: {path}"})
             except Exception as e:
                 results.append({"path": path, "success": False, "error": str(e)})
-        return {
-            "success": all(r["success"] for r in results),
-            "operation": "rmdir",
-            "results": results
-        }
+                overall_success = False
 
     elif operation == "read":
-        if not paths:
-            return {"success": False, "error": "paths is required for read operation"}
-        results = []
         for path in paths:
             try:
-                with open(path, "r") as f:
+                if not os.path.isfile(path):
+                    results.append({"path": path, "success": False, "error": f"File not found: {path}"})
+                    overall_success = False
+                    continue
+                with open(path, "r", errors="replace") as f:
                     content = f.read()
                 results.append({"path": path, "success": True, "content": content})
             except Exception as e:
                 results.append({"path": path, "success": False, "error": str(e)})
+                overall_success = False
+    else:
         return {
-            "success": all(r["success"] for r in results),
-            "operation": "read",
-            "results": results
+            "success": False,
+            "error": f"Unknown operation: '{operation}'. Must be one of: mkdir, rmdir, read",
+            "operation": operation
         }
 
-    elif operation == "exec":
-        if not command:
-            return {"success": False, "error": "command is required for exec operation"}
-
-        exec_cmd = [command]
-        if args:
-            exec_cmd.extend(args)
-
-        result = _run_command(exec_cmd)
-        result["operation"] = "exec"
-        return result
-
-    return {"success": False, "error": f"Unhandled operation: {operation}"}
-
-
-@mcp.tool()
-async def get_diagnostic_data(
-    include_docker_logs: Optional[bool] = True,
-    services: Optional[List[str]] = None,
-    tail_lines: Optional[int] = 100,
-    output_file: Optional[str] = None
-) -> dict:
-    """
-    Collect and print diagnostic data about the FerretDB environment, including Docker Compose
-    service logs and system information. Use this when troubleshooting failures, investigating
-    test errors, or gathering information about the running environment state.
-    """
-    diagnostic_results = {}
-
-    if include_docker_logs:
-        # docker compose logs
-        logs_cmd = ["docker", "compose", "logs", f"--tail={tail_lines}"]
-        if services:
-            logs_cmd.extend(services)
-        docker_logs_result = _run_command(logs_cmd)
-        diagnostic_results["docker_compose_logs"] = docker_logs_result
-
-        # docker compose ps
-        ps_result = _run_command(["docker", "compose", "ps", "--all"])
-        diagnostic_results["docker_compose_ps"] = ps_result
-
-        # docker stats
-        stats_result = _run_command(["docker", "stats", "--all", "--no-stream"])
-        diagnostic_results["docker_stats"] = stats_result
-
-    # System info
-    git_result = _run_command(["git", "version"])
-    diagnostic_results["git_version"] = git_result
-
-    docker_version_result = _run_command(["docker", "version"])
-    diagnostic_results["docker_version"] = docker_version_result
-
-    compose_version_result = _run_command(["docker", "compose", "version"])
-    diagnostic_results["docker_compose_version"] = compose_version_result
-
-    go_version_result = _run_command(["go", "version"])
-    diagnostic_results["go_version"] = go_version_result
-
-    # FerretDB version if available
-    ferretdb_bin = shutil.which("ferretdb")
-    if ferretdb_bin:
-        ferretdb_version = _run_command(["ferretdb", "--version"])
-        diagnostic_results["ferretdb_version"] = ferretdb_version
-
-    # Compile full output
-    output_lines = ["=== FerretDB Diagnostic Data ==="]
-    for key, val in diagnostic_results.items():
-        output_lines.append(f"
---- {key} ---")
-        if isinstance(val, dict):
-            if val.get("stdout"):
-                output_lines.append(val["stdout"])
-            if val.get("stderr"):
-                output_lines.append(f"STDERR: {val['stderr']}")
-            if val.get("error"):
-                output_lines.append(f"ERROR: {val['error']}")
-        else:
-            output_lines.append(str(val))
-
-    full_output = "
-".join(output_lines)
-
-    if output_file:
-        try:
-            with open(output_file, "w") as f:
-                f.write(full_output)
-            diagnostic_results["output_file"] = {
-                "success": True,
-                "path": output_file,
-                "bytes_written": len(full_output)
-            }
-        except Exception as e:
-            diagnostic_results["output_file"] = {
-                "success": False,
-                "error": str(e)
-            }
-
-    diagnostic_results["full_output"] = full_output
-    diagnostic_results["config"] = {
-        "include_docker_logs": include_docker_logs,
-        "services": services,
-        "tail_lines": tail_lines,
-        "output_file": output_file
+    return {
+        "success": overall_success,
+        "operation": operation,
+        "results": results
     }
-
-    return diagnostic_results
 
 
 if __name__ == "__main__":
