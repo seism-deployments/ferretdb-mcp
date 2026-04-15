@@ -549,7 +549,7 @@ class _BrowserFallbackMiddleware:
                 return
         await self.app(scope, receive, send)
 
-_mcp_asgi = mcp.streamable_http_app()
+_mcp_asgi = mcp.http_app()
 app = _BrowserFallbackMiddleware(_mcp_asgi)
 
 
